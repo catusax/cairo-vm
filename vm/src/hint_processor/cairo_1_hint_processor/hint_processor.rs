@@ -25,6 +25,7 @@ use cairo_lang_casm::{
 use core::any::Any;
 use core::ops::Shl;
 
+use super::{memory_buffer, syscall};
 use num_bigint::{BigInt, BigUint};
 use num_integer::{ExtendedGcd, Integer};
 use num_traits::{Signed, ToPrimitive};
@@ -289,9 +290,95 @@ impl Cairo1HintProcessor {
                 }
             }
 
+            Hint::Starknet(StarknetHint::SystemCall { system }) => {
+                Ok(self.execute_syscall(system, vm, exec_scopes)?)
+            }
+
             hint => Err(HintError::UnknownHint(
                 format!("{:?}", hint).into_boxed_str(),
             )),
+        }
+    }
+
+    /// Executes a syscall.
+    fn execute_syscall(
+        &self,
+        system: &ResOperand,
+        vm: &mut VirtualMachine,
+        exec_scopes: &mut ExecutionScopes,
+    ) -> Result<(), HintError> {
+        let system_ptr = as_relocatable(vm, system)?;
+        let mut system_buffer = memory_buffer::MemBuffer::new(vm, system_ptr);
+        let selector = system_buffer.next_felt252()?.to_bytes_be();
+        let mut gas_counter = system_buffer.next_usize()?;
+        let mut execute_handle_helper =
+            |handler: &mut dyn FnMut(
+                // The syscall buffer.
+                &mut memory_buffer::MemBuffer<'_>,
+                // The gas counter.
+                &mut usize,
+            ) -> Result<syscall::SyscallResult, HintError>| {
+                match handler(&mut system_buffer, &mut gas_counter)? {
+                    syscall::SyscallResult::Success(values) => {
+                        system_buffer.write(gas_counter)?;
+                        system_buffer.write(Felt252::from(0))?;
+                        system_buffer.write_data(values.into_iter())?;
+                    }
+                    syscall::SyscallResult::Failure(revert_reason) => {
+                        println!("syscall failed!");
+                        system_buffer.write(gas_counter)?;
+                        system_buffer.write(Felt252::from(1))?;
+                        system_buffer.write_arr(revert_reason.into_iter())?;
+                    }
+                }
+                Ok(())
+            };
+        let selector = std::str::from_utf8(&selector)
+            .unwrap()
+            .trim_start_matches('\0');
+        // *self
+        //     .syscalls_used_resources
+        //     .syscalls
+        //     .entry(selector.into())
+        //     .or_default() += 1;
+        println!("selector:::: {}", selector);
+        match selector {
+            "Secp256k1New" => execute_handle_helper(&mut |system_buffer, gas_counter| {
+                syscall::secp256k1_new(
+                    gas_counter,
+                    system_buffer.next_u256()?,
+                    system_buffer.next_u256()?,
+                    exec_scopes,
+                )
+            }),
+            "Secp256k1Add" => execute_handle_helper(&mut |system_buffer, gas_counter| {
+                syscall::secp256k1_add(
+                    gas_counter,
+                    exec_scopes,
+                    system_buffer.next_usize()?,
+                    system_buffer.next_usize()?,
+                )
+            }),
+            "Secp256k1Mul" => execute_handle_helper(&mut |system_buffer, gas_counter| {
+                syscall::secp256k1_mul(
+                    gas_counter,
+                    system_buffer.next_usize()?,
+                    system_buffer.next_u256()?,
+                    exec_scopes,
+                )
+            }),
+            "Secp256k1GetPointFromX" => execute_handle_helper(&mut |system_buffer, gas_counter| {
+                syscall::secp256k1_get_point_from_x(
+                    gas_counter,
+                    system_buffer.next_u256()?,
+                    system_buffer.next_bool()?,
+                    exec_scopes,
+                )
+            }),
+            "Secp256k1GetXy" => execute_handle_helper(&mut |system_buffer, gas_counter| {
+                syscall::secp256k1_get_xy(gas_counter, system_buffer.next_usize()?, exec_scopes)
+            }),
+            _ => panic!("Unknown selector for system call!"),
         }
     }
 
